@@ -1,0 +1,7 @@
+build_linux/
+build/
+*.py
+*.js
+appendonly.aof
+11_server.cpp
+server11.cpp
