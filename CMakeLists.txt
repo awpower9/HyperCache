@@ -10,6 +10,7 @@ add_executable(server
     hashtable.cpp
     avl.cpp
     zset.cpp
+    thread_pool.cpp
 )
 
 # ---- Client Executable ----

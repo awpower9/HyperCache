@@ -1,4 +1,4 @@
-﻿#include <assert.h>
+#include <assert.h>
 #include <stdlib.h>     // calloc(), free()
 #include "hashtable.h"
 
@@ -139,3 +139,38 @@ void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg) {
     h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
 }
 
+size_t hm_scan(HMap *hmap, size_t cursor, size_t limit, bool (*f)(HNode *, void *), void *arg) {
+    size_t count = 0;
+    while (count < limit) {
+        if (!hmap->newer.tab) {
+            return 0; // empty
+        }
+        
+        size_t total_mask = hmap->newer.mask;
+        if (hmap->older.tab) {
+            total_mask += hmap->older.mask + 1;
+        }
+
+        if (cursor > total_mask) {
+            return 0;
+        }
+
+        HNode *node = NULL;
+        if (cursor <= hmap->newer.mask) {
+            node = hmap->newer.tab[cursor];
+        } else if (hmap->older.tab) {
+            node = hmap->older.tab[cursor - hmap->newer.mask - 1];
+        }
+
+        while (node) {
+            if (!f(node, arg)) {
+                return cursor + 1;
+            }
+            count++;
+            node = node->next;
+        }
+        
+        cursor++;
+    }
+    return cursor;
+}

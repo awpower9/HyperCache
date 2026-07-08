@@ -12,11 +12,17 @@
 #include <vector>
 #include <chrono>
 #include <atomic>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
 #include <signal.h>
 // proj
 #include "common.h"
 #include "hashtable.h"
 #include "zset.h"
+#include "thread_pool.h"
+
+static ThreadPool *g_thread_pool = nullptr;
 
 
 static void msg_errno(const char *m) {
@@ -70,6 +76,10 @@ struct Conn {
     // transaction state
     bool in_transaction = false;
     std::vector<std::vector<std::string>> tx_queue;
+
+    // pub/sub state
+    bool is_subscribed = false;
+    std::unordered_set<std::string> subscribed_channels;
 };
 
 // application callback when the listening socket is ready
@@ -352,6 +362,27 @@ static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     return out_int(out, node ? 1 : 0);
 }
 
+static void do_unlink(std::vector<std::string> &cmd, Buffer &out) {
+    // a dummy struct just for the lookup
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable delete
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if (node) { // deallocate the pair asynchronously
+        Entry *ent = container_of(node, Entry, node);
+        if (g_thread_pool) {
+            g_thread_pool->enqueue([ent]() {
+                entry_del(ent);
+            });
+        } else {
+            entry_del(ent);
+        }
+        aof_append(cmd);
+    }
+    return out_int(out, node ? 1 : 0);
+}
+
 static bool cb_keys(HNode *node, void *arg) {
     Buffer &out = *(Buffer *)arg;
     const std::string &key = container_of(node, Entry, node)->key;
@@ -374,6 +405,41 @@ static bool str2int(const std::string &s, int64_t &out) {
     char *endp = NULL;
     out = strtoll(s.c_str(), &endp, 10);
     return endp == s.c_str() + s.size();
+}
+
+static bool cmd_is(const std::string &a, const char *b);
+
+static bool cb_scan(HNode *node, void *arg) {
+    std::vector<std::string> *keys = (std::vector<std::string> *)arg;
+    const std::string &key = container_of(node, Entry, node)->key;
+    keys->push_back(key);
+    return true;
+}
+
+static void do_scan(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t cursor = 0;
+    if (!str2int(cmd[1], cursor) || cursor < 0) {
+        return out_err(out, ERR_BAD_ARG, "invalid cursor");
+    }
+    int64_t count = 10;
+    if (cmd.size() >= 4 && cmd_is(cmd[2], "count")) {
+        if (!str2int(cmd[3], count) || count <= 0) {
+            return out_err(out, ERR_BAD_ARG, "invalid count");
+        }
+    } else if (cmd.size() > 2) {
+        return out_err(out, ERR_BAD_ARG, "syntax error");
+    }
+
+    std::vector<std::string> keys;
+    size_t next_cursor = hm_scan(&g_data.db, (size_t)cursor, (size_t)count, &cb_scan, &keys);
+
+    out_arr(out, 2);
+    std::string next_cursor_str = std::to_string(next_cursor);
+    out_str(out, next_cursor_str.data(), next_cursor_str.size());
+    out_arr(out, (uint32_t)keys.size());
+    for (const auto &k : keys) {
+        out_str(out, k.data(), k.size());
+    }
 }
 
 // zadd zset score name
@@ -497,6 +563,15 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
     }
 }
 
+struct Timer {
+    uint64_t expire_at;
+    std::string key;
+    bool operator>(const Timer &other) const {
+        return expire_at > other.expire_at;
+    }
+};
+static std::priority_queue<Timer, std::vector<Timer>, std::greater<Timer>> g_timers;
+
 static void do_ping(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 1) {
         std::string pong = "+PONG\r\n";
@@ -520,6 +595,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer &out) {
     if (node && !entry_del_if_expired(node)) {
         Entry *ent = container_of(node, Entry, node);
         ent->expire_at = get_time_ms() + ttl_ms;
+        g_timers.push({ent->expire_at, ent->key});
         aof_append(cmd);
         out_int(out, 1);
     } else {
@@ -603,6 +679,132 @@ static bool cmd_is(const std::string &a, const char *b) {
     return true;
 }
 
+static std::unordered_map<std::string, std::unordered_set<Conn*>> g_channels;
+
+static void do_subscribe(std::vector<std::string> &cmd, Conn *conn) {
+    conn->is_subscribed = true;
+    for (size_t i = 1; i < cmd.size(); ++i) {
+        const std::string &channel = cmd[i];
+        conn->subscribed_channels.insert(channel);
+        g_channels[channel].insert(conn);
+        
+        out_arr(conn->outgoing, 3);
+        out_str(conn->outgoing, "subscribe", 9);
+        out_str(conn->outgoing, channel.data(), channel.size());
+        out_int(conn->outgoing, conn->subscribed_channels.size());
+    }
+}
+
+static void do_unsubscribe(std::vector<std::string> &cmd, Conn *conn) {
+    if (cmd.size() == 1) { // unsubscribe from all
+        std::vector<std::string> to_remove(conn->subscribed_channels.begin(), conn->subscribed_channels.end());
+        for (const std::string &channel : to_remove) {
+            conn->subscribed_channels.erase(channel);
+            g_channels[channel].erase(conn);
+            
+            out_arr(conn->outgoing, 3);
+            out_str(conn->outgoing, "unsubscribe", 11);
+            out_str(conn->outgoing, channel.data(), channel.size());
+            out_int(conn->outgoing, conn->subscribed_channels.size());
+        }
+    } else {
+        for (size_t i = 1; i < cmd.size(); ++i) {
+            const std::string &channel = cmd[i];
+            conn->subscribed_channels.erase(channel);
+            g_channels[channel].erase(conn);
+            
+            out_arr(conn->outgoing, 3);
+            out_str(conn->outgoing, "unsubscribe", 11);
+            out_str(conn->outgoing, channel.data(), channel.size());
+            out_int(conn->outgoing, conn->subscribed_channels.size());
+        }
+    }
+    if (conn->subscribed_channels.empty()) {
+        conn->is_subscribed = false;
+    }
+}
+
+static void do_publish(std::vector<std::string> &cmd, Buffer &out) {
+    if (cmd.size() != 3) {
+        return out_err(out, ERR_BAD_ARG, "syntax error");
+    }
+    const std::string &channel = cmd[1];
+    const std::string &message = cmd[2];
+    
+    auto it = g_channels.find(channel);
+    int64_t receivers = 0;
+    if (it != g_channels.end()) {
+        for (Conn *conn : it->second) {
+            out_arr(conn->outgoing, 3);
+            out_str(conn->outgoing, "message", 7);
+            out_str(conn->outgoing, channel.data(), channel.size());
+            out_str(conn->outgoing, message.data(), message.size());
+            conn->want_write = true;
+            receivers++;
+        }
+    }
+    out_int(out, receivers);
+}
+static bool cb_save(HNode *node, void *arg) {
+    FILE *f = (FILE *)arg;
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->expire_at > 0 && ent->expire_at <= get_time_ms()) {
+        return true; // skip expired
+    }
+    
+    // Type (uint8_t)
+    uint8_t type = ent->type;
+    fwrite(&type, 1, 1, f);
+    
+    // TTL
+    uint64_t ttl = ent->expire_at;
+    fwrite(&ttl, 1, 8, f);
+    
+    // Key
+    uint32_t klen = (uint32_t)ent->key.size();
+    fwrite(&klen, 1, 4, f);
+    fwrite(ent->key.data(), 1, klen, f);
+    
+    if (type == T_STR) {
+        uint32_t vlen = (uint32_t)ent->str.size();
+        fwrite(&vlen, 1, 4, f);
+        fwrite(ent->str.data(), 1, vlen, f);
+    } else if (type == T_ZSET) {
+        uint32_t zsize = (uint32_t)hm_size(&ent->zset.hmap);
+        fwrite(&zsize, 1, 4, f);
+        
+        hm_foreach(&ent->zset.hmap, [](HNode *zhn, void *zarg) -> bool {
+            FILE *f_z = (FILE *)zarg;
+            ZNode *znode = container_of(zhn, ZNode, hmap);
+            fwrite(&znode->score, 1, 8, f_z);
+            uint32_t nlen = (uint32_t)znode->len;
+            fwrite(&nlen, 1, 4, f_z);
+            fwrite(znode->name, 1, nlen, f_z);
+            return true;
+        }, f);
+    }
+    return true;
+}
+
+static void do_save(std::vector<std::string> &cmd, Buffer &out) {
+    FILE *f = fopen("dump.rdb", "wb");
+    if (!f) {
+        return out_err(out, ERR_UNKNOWN, "failed to open dump.rdb");
+    }
+    
+    // Magic string
+    fwrite("RDB0", 1, 4, f);
+    
+    hm_foreach(&g_data.db, cb_save, (void *)f);
+    
+    // End marker
+    uint8_t end_marker = 255;
+    fwrite(&end_marker, 1, 1, f);
+    
+    fclose(f);
+    buf_append(out, (const uint8_t *)"+OK\r\n", 5);
+}
+
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     g_total_commands.fetch_add(1, std::memory_order_relaxed);
     if (cmd.size() >= 1 && cmd_is(cmd[0], "ping")) {
@@ -617,12 +819,16 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_incr(cmd, out);
     } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
         return do_del(cmd, out);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "unlink")) {
+        return do_unlink(cmd, out);
     } else if (cmd.size() == 1 && cmd_is(cmd[0], "keys")) {
         return do_keys(cmd, out);
     } else if (cmd.size() == 3 && cmd_is(cmd[0], "expire")) {
         return do_expire(cmd, out);
     } else if (cmd.size() == 2 && cmd_is(cmd[0], "ttl")) {
         return do_ttl(cmd, out);
+    } else if (cmd.size() >= 2 && cmd_is(cmd[0], "scan")) {
+        return do_scan(cmd, out);
     } else if (cmd.size() == 4 && cmd_is(cmd[0], "zadd")) {
         return do_zadd(cmd, out);
     } else if (cmd.size() == 3 && cmd_is(cmd[0], "zrem")) {
@@ -631,6 +837,8 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_zscore(cmd, out);
     } else if (cmd.size() == 6 && cmd_is(cmd[0], "zquery")) {
         return do_zquery(cmd, out);
+    } else if (cmd.size() == 1 && cmd_is(cmd[0], "save")) {
+        return do_save(cmd, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
@@ -645,7 +853,19 @@ static bool try_one_request(Conn *conn) {
     }
 
     if (cmd.size() > 0) {
-        if (cmd.size() == 1 && cmd_is(cmd[0], "multi")) {
+        if (conn->is_subscribed) {
+            if (cmd.size() >= 1 && (cmd_is(cmd[0], "subscribe") || cmd_is(cmd[0], "unsubscribe") || cmd_is(cmd[0], "ping"))) {
+                if (cmd_is(cmd[0], "subscribe")) do_subscribe(cmd, conn);
+                else if (cmd_is(cmd[0], "unsubscribe")) do_unsubscribe(cmd, conn);
+                else do_request(cmd, conn->outgoing);
+            } else {
+                out_err(conn->outgoing, ERR_UNKNOWN, "Can only issue SUBSCRIBE, UNSUBSCRIBE, PING in subscribe mode");
+            }
+        } else if (cmd.size() >= 1 && cmd_is(cmd[0], "subscribe")) {
+            do_subscribe(cmd, conn);
+        } else if (cmd.size() >= 1 && cmd_is(cmd[0], "publish")) {
+            do_publish(cmd, conn->outgoing);
+        } else if (cmd.size() == 1 && cmd_is(cmd[0], "multi")) {
             conn->in_transaction = true;
             buf_append(conn->outgoing, (const uint8_t *)"+OK\r\n", 5);
         } else if (cmd.size() == 1 && cmd_is(cmd[0], "discard")) {
@@ -773,26 +993,74 @@ static void aof_load() {
 }
 
 
-// ============================================================================
-// epoll helpers
-// ============================================================================
-int g_epoll_fd = -1;
-
-static void conn_update_epoll(Conn *conn) {
-    if (g_epoll_fd < 0) return;
-    struct epoll_event ev = {};
-    if (conn->want_read) ev.events |= EPOLLIN;
-    if (conn->want_write) ev.events |= EPOLLOUT;
-    ev.data.fd = conn->fd;
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+static void rdb_load() {
+    FILE *f = fopen("dump.rdb", "rb");
+    if (!f) return;
+    
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "RDB0", 4) != 0) {
+        fclose(f);
+        return;
+    }
+    
+    while (true) {
+        uint8_t type;
+        if (fread(&type, 1, 1, f) != 1) break;
+        if (type == 255) break; // EOF marker
+        
+        uint64_t ttl;
+        if (fread(&ttl, 1, 8, f) != 1) break;
+        
+        uint32_t klen;
+        if (fread(&klen, 1, 4, f) != 1) break;
+        std::string key(klen, '\0');
+        if (fread(&key[0], 1, klen, f) != klen) break;
+        
+        Entry *ent = entry_new(type);
+        ent->key = key;
+        ent->node.hcode = str_hash((uint8_t *)key.data(), key.size());
+        ent->expire_at = ttl;
+        if (ttl > 0) {
+            g_timers.push({ttl, key});
+        }
+        
+        if (type == T_STR) {
+            uint32_t vlen;
+            if (fread(&vlen, 1, 4, f) != 1) break;
+            ent->str.resize(vlen);
+            if (fread(&ent->str[0], 1, vlen, f) != vlen) break;
+        } else if (type == T_ZSET) {
+            uint32_t zsize;
+            if (fread(&zsize, 1, 4, f) != 1) break;
+            for (uint32_t i = 0; i < zsize; i++) {
+                double score;
+                if (fread(&score, 1, 8, f) != 1) break;
+                uint32_t nlen;
+                if (fread(&nlen, 1, 4, f) != 1) break;
+                std::string name(nlen, '\0');
+                if (fread(&name[0], 1, nlen, f) != nlen) break;
+                zset_insert(&ent->zset, name.data(), name.size(), score);
+            }
+        }
+        hm_insert(&g_data.db, &ent->node);
+    }
+    
+    fclose(f);
 }
+
+// ============================================================================
+// poll helpers
+// ============================================================================
 
 int main() {
     socket_init();
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+
+    g_thread_pool = new ThreadPool(4);
     
-    // load data from AOF before opening it
+    // load data from RDB and AOF
+    rdb_load();
     aof_load();
     
     // open AOF for appending
@@ -829,31 +1097,30 @@ int main() {
     // a map of all client connections, keyed by fd
     std::vector<Conn *> fd2conn;
     
-    g_epoll_fd = epoll_create1(0);
-    struct epoll_event listen_ev = {};
-    listen_ev.events = EPOLLIN;
-    listen_ev.data.fd = fd;
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &listen_ev);
 
-    struct epoll_event events[128];
 
     // the event loop
     while (!g_quit) {
-        // Active expiration: sample a few keys each tick
-        if (hm_size(&g_data.db) > 0) {
-            size_t buckets_to_check = 20;
-            HTab *htab = &g_data.db.newer;
-            static size_t scan_cursor = 0;
-            for (size_t i = 0; i < buckets_to_check; i++) {
-                if (htab->mask == 0) break; // empty or not init
-                scan_cursor = (scan_cursor + 1) & htab->mask;
-                HNode *node = htab->tab[scan_cursor];
-                while (node) {
-                    HNode *next = node->next; // save next before possible deletion
-                    entry_del_if_expired(node);
-                    node = next;
+        // Active expiration: using Min-Heap
+        uint64_t now = get_time_ms();
+        while (!g_timers.empty()) {
+            const Timer &t = g_timers.top();
+            if (t.expire_at > now) {
+                break;
+            }
+            
+            LookupKey key;
+            key.key = t.key;
+            key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+            HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+            if (node) {
+                Entry *ent = container_of(node, Entry, node);
+                if (ent->expire_at == t.expire_at) {
+                    hm_delete(&g_data.db, &key.node, &entry_eq);
+                    entry_del(ent);
                 }
             }
+            g_timers.pop();
         }
         
         // Approximated LRU eviction
@@ -882,13 +1149,34 @@ int main() {
             }
         }
 
-        int num_events = epoll_wait(g_epoll_fd, events, 128, 100);
-        if (num_events < 0 && sock_interrupted()) continue;
-        if (num_events < 0) die("epoll_wait");
+        std::vector<struct pollfd> poll_args;
+        
+        // Add listening socket
+        struct pollfd pfd = {};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        poll_args.push_back(pfd);
 
-        for (int i = 0; i < num_events; i++) {
-            int active_fd = events[i].data.fd;
-            uint32_t ready = events[i].events;
+        for (Conn *conn : fd2conn) {
+            if (!conn) continue;
+            struct pollfd cpfd = {};
+            cpfd.fd = conn->fd;
+            if (conn->want_read) cpfd.events |= POLLIN;
+            if (conn->want_write) cpfd.events |= POLLOUT;
+            if (cpfd.events) {
+                cpfd.events |= POLLERR | POLLHUP;
+                poll_args.push_back(cpfd);
+            }
+        }
+        
+        int rv = sock_poll(poll_args.data(), poll_args.size(), 100);
+        if (rv < 0 && sock_interrupted()) continue;
+        if (rv < 0) die("sock_poll");
+
+        for (const struct pollfd &pfd_res : poll_args) {
+            if (!pfd_res.revents) continue;
+            socket_t active_fd = pfd_res.fd;
+            uint32_t ready = pfd_res.revents;
 
             if (active_fd == fd) {
                 // handle the listening socket
@@ -898,35 +1186,33 @@ int main() {
                     }
                     assert(!fd2conn[conn->fd]);
                     fd2conn[conn->fd] = conn;
-
-                    struct epoll_event cev = {};
-                    cev.events = EPOLLIN; // want_read is true by default
-                    cev.data.fd = conn->fd;
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, conn->fd, &cev);
                 }
             } else {
                 // handle connection sockets
                 Conn *conn = fd2conn[active_fd];
                 if (!conn) continue;
 
-                if (ready & EPOLLIN) {
+                if (ready & POLLIN) {
                     assert(conn->want_read);
                     handle_read(conn);  // application logic
                 }
-                if (ready & EPOLLOUT) {
+                if (ready & POLLOUT) {
                     assert(conn->want_write);
                     handle_write(conn); // application logic
                 }
 
                 // close the socket from socket error or application logic
-                if ((ready & (EPOLLERR | EPOLLHUP)) || conn->want_close) {
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+                if ((ready & (POLLERR | POLLHUP)) || conn->want_close) {
+                    for (const std::string &channel : conn->subscribed_channels) {
+                        g_channels[channel].erase(conn);
+                        if (g_channels[channel].empty()) {
+                            g_channels.erase(channel);
+                        }
+                    }
                     (void)close_socket(conn->fd);
                     fd2conn[conn->fd] = NULL;
                     delete conn;
                     g_current_connections.fetch_sub(1, std::memory_order_relaxed);
-                } else {
-                    conn_update_epoll(conn);
                 }
             }
         }
@@ -944,6 +1230,7 @@ int main() {
         fclose(g_aof);
     }
     socket_cleanup();
+    delete g_thread_pool;
     return 0;
 }
 
