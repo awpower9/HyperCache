@@ -21,6 +21,11 @@
 #include "hashtable.h"
 #include "zset.h"
 #include "thread_pool.h"
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/wait.h>
+static pid_t g_bgsave_pid = -1;
+#endif
 
 static ThreadPool *g_thread_pool = nullptr;
 
@@ -805,6 +810,37 @@ static void do_save(std::vector<std::string> &cmd, Buffer &out) {
     buf_append(out, (const uint8_t *)"+OK\r\n", 5);
 }
 
+static void do_bgsave(std::vector<std::string> &cmd, Buffer &out) {
+#ifdef _WIN32
+    return out_err(out, ERR_UNKNOWN, "BGSAVE not supported natively on Windows. Use SAVE.");
+#else
+    if (g_bgsave_pid != -1) {
+        return out_err(out, ERR_UNKNOWN, "Background save already in progress");
+    }
+    
+    pid_t pid = fork();
+    if (pid < 0) {
+        return out_err(out, ERR_UNKNOWN, "fork() failed");
+    }
+    
+    if (pid == 0) {
+        // Child process (uses CoW memory)
+        FILE *f = fopen("dump.rdb", "wb");
+        if (!f) exit(1);
+        fwrite("RDB0", 1, 4, f);
+        hm_foreach(&g_data.db, cb_save, (void *)f);
+        uint8_t end_marker = 255;
+        fwrite(&end_marker, 1, 1, f);
+        fclose(f);
+        exit(0);
+    }
+    
+    // Parent process
+    g_bgsave_pid = pid;
+    buf_append(out, (const uint8_t *)"+Background saving started\r\n", 28);
+#endif
+}
+
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     g_total_commands.fetch_add(1, std::memory_order_relaxed);
     if (cmd.size() >= 1 && cmd_is(cmd[0], "ping")) {
@@ -839,6 +875,8 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_zquery(cmd, out);
     } else if (cmd.size() == 1 && cmd_is(cmd[0], "save")) {
         return do_save(cmd, out);
+    } else if (cmd.size() == 1 && cmd_is(cmd[0], "bgsave")) {
+        return do_bgsave(cmd, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
@@ -1121,6 +1159,16 @@ int main() {
 
     // the event loop
     while (!g_quit) {
+#ifndef _WIN32
+        if (g_bgsave_pid != -1) {
+            int stat_loc;
+            pid_t res = waitpid(g_bgsave_pid, &stat_loc, WNOHANG);
+            if (res == g_bgsave_pid) {
+                g_bgsave_pid = -1;
+                msg("BGSAVE finished successfully in the background.");
+            }
+        }
+#endif
         // Active expiration: using Min-Heap
         uint64_t now = get_time_ms();
         while (!g_timers.empty()) {
@@ -1237,7 +1285,6 @@ int main() {
             if (conn->want_read) cpfd.events |= POLLIN;
             if (conn->want_write) cpfd.events |= POLLOUT;
             if (cpfd.events) {
-                cpfd.events |= POLLERR | POLLHUP;
                 poll_args.push_back(cpfd);
             }
         }
