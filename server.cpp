@@ -1049,8 +1049,21 @@ static void rdb_load() {
 }
 
 // ============================================================================
-// poll helpers
 // ============================================================================
+// epoll / poll helpers
+// ============================================================================
+
+#ifndef _WIN32
+int g_epoll_fd = -1;
+static void conn_update_epoll(Conn *conn) {
+    if (g_epoll_fd < 0) return;
+    struct epoll_event ev = {};
+    if (conn->want_read) ev.events |= EPOLLIN;
+    if (conn->want_write) ev.events |= EPOLLOUT;
+    ev.data.fd = conn->fd;
+    epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+}
+#endif
 
 int main() {
     socket_init();
@@ -1097,7 +1110,14 @@ int main() {
     // a map of all client connections, keyed by fd
     std::vector<Conn *> fd2conn;
     
-
+#ifndef _WIN32
+    g_epoll_fd = epoll_create1(0);
+    struct epoll_event listen_ev = {};
+    listen_ev.events = EPOLLIN;
+    listen_ev.data.fd = fd;
+    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &listen_ev);
+    struct epoll_event events[128];
+#endif
 
     // the event loop
     while (!g_quit) {
@@ -1149,6 +1169,59 @@ int main() {
             }
         }
 
+#ifndef _WIN32
+        int num_events = epoll_wait(g_epoll_fd, events, 128, 100);
+        if (num_events < 0 && sock_interrupted()) continue;
+        if (num_events < 0) die("epoll_wait");
+
+        for (int i = 0; i < num_events; i++) {
+            int active_fd = events[i].data.fd;
+            uint32_t ready = events[i].events;
+
+            if (active_fd == fd) {
+                if (Conn *conn = handle_accept(fd)) {
+                    if (fd2conn.size() <= (size_t)conn->fd) {
+                        fd2conn.resize(conn->fd + 1);
+                    }
+                    assert(!fd2conn[conn->fd]);
+                    fd2conn[conn->fd] = conn;
+
+                    struct epoll_event cev = {};
+                    cev.events = EPOLLIN;
+                    cev.data.fd = conn->fd;
+                    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, conn->fd, &cev);
+                }
+            } else {
+                Conn *conn = fd2conn[active_fd];
+                if (!conn) continue;
+
+                if (ready & EPOLLIN) {
+                    assert(conn->want_read);
+                    handle_read(conn);
+                }
+                if (ready & EPOLLOUT) {
+                    assert(conn->want_write);
+                    handle_write(conn);
+                }
+
+                if ((ready & (EPOLLERR | EPOLLHUP)) || conn->want_close) {
+                    for (const std::string &channel : conn->subscribed_channels) {
+                        g_channels[channel].erase(conn);
+                        if (g_channels[channel].empty()) {
+                            g_channels.erase(channel);
+                        }
+                    }
+                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+                    (void)close_socket(conn->fd);
+                    fd2conn[conn->fd] = NULL;
+                    delete conn;
+                    g_current_connections.fetch_sub(1, std::memory_order_relaxed);
+                } else {
+                    conn_update_epoll(conn);
+                }
+            }
+        }
+#else
         std::vector<struct pollfd> poll_args;
         
         // Add listening socket
@@ -1216,6 +1289,7 @@ int main() {
                 }
             }
         }
+#endif
     }   // the event loop
     
     // Graceful Shutdown
