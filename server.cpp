@@ -599,7 +599,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer &out) {
     
     if (node && !entry_del_if_expired(node)) {
         Entry *ent = container_of(node, Entry, node);
-        ent->expire_at = get_time_ms() + ttl_ms;
+        ent->expire_at = get_time_ms() + (ttl_ms * 1000);
         g_timers.push({ent->expire_at, ent->key});
         aof_append(cmd);
         out_int(out, 1);
@@ -1281,7 +1281,7 @@ int main() {
         for (Conn *conn : fd2conn) {
             if (!conn) continue;
             struct pollfd cpfd = {};
-            cpfd.fd = conn->fd;
+            cpfd.fd = conn->fd; 
             if (conn->want_read) cpfd.events |= POLLIN;
             if (conn->want_write) cpfd.events |= POLLOUT;
             if (cpfd.events) {
@@ -1323,7 +1323,7 @@ int main() {
 
                 // close the socket from socket error or application logic
                 if ((ready & (POLLERR | POLLHUP)) || conn->want_close) {
-                    for (const std::string &channel : conn->subscribed_channels) {
+                    for (const std::string &channel : conn->subscribed_channels) {  
                         g_channels[channel].erase(conn);
                         if (g_channels[channel].empty()) {
                             g_channels.erase(channel);
